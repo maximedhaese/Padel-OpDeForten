@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 # ==========================================
-# 1. FIXED SYSTEM CONFIGURATION - test
+# 1. FIXED SYSTEM CONFIGURATION
 # ==========================================
 NUM_PANELS = 42
 WP_PER_PANEL = 470  # Total: 19.74 kWp
