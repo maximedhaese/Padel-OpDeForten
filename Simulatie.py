@@ -8,46 +8,58 @@ import pandas as pd
 # ==========================================
 NUM_PANELS = 42
 WP_PER_PANEL = 470  # Total: 19.74 kWp
-SYSTEM_LOSSES = 0.14
-PANEL_TILT = 35.0
-PANEL_AZIMUTH = 180.0
+PANEL_TILT = 35.0  # Optimum South tilt (degrees)
+PANEL_AZIMUTH = 180.0  # 180° = South
 
-BATTERY_CAPACITY_KWH = 30.0  # Fixed capacity
-BATTERY_MAX_POWER_KW = 10.0  # Fixed inverter power
-ROUND_TRIP_EFFICIENCY = 0.92
-MIN_SOC = 0.05
-MAX_SOC = 1.00
+BATTERY_CAPACITY_KWH = 30.0  # Storage capacity in kWh
+BATTERY_MAX_POWER_KW = 10.0  # Inverter continuous AC rating in kW
+ROUND_TRIP_EFFICIENCY = 0.92  # 92% round-trip efficiency
+MIN_SOC = 0.05  # 5% reserve limit (95% DoD)
+MAX_SOC = 1.00  # 100% max charge
 INITIAL_SOC = 0.50
 
-INSTALLATION_COST = 30000.0  # Fixed Capex (€)
-BASE_ELEC_PRICE = 0.28  # Reference grid import price (€/kWh)
-BASE_INJ_TARIFF = 0.05  # Reference grid injection price (€/kWh)
+INSTALLATION_COST = 30000.0  # Turnkey Capex in €
+BASE_ELEC_PRICE = 0.28  # All-in grid import tariff (€/kWh)
+BASE_INJ_TARIFF = 0.05  # Grid injection tariff (€/kWh)
+CAPACITY_TARIFF_EUR_PER_KW = 48.0  # Flanders reference capacity tariff (€/kW/yr)
 
-LATITUDE = 51.05
+LATITUDE = 51.05  # Ghent region
 LONGITUDE = 3.72
-CLIMATIC_YIELD_FACTOR = 0.65
 
 FILE_NAME = "Kwartierwaarden verbruik - Opdeforten MDH.xlsx"
 FILE_PATH = Path(__file__).resolve().parent / FILE_NAME
 
 
 # ==========================================
-# 2. PV PRODUCTION & DATASET ASSEMBLY
+# 2. PV PRODUCTION (DST-AWARE & PVGIS CALIBRATED)
 # ==========================================
 def calculate_pv_generation(
-    timestamps: pd.DatetimeIndex, peak_kwp: float
+    timestamps: pd.DatetimeIndex,
+    peak_kwp: float,
+    tilt: float = 35.0,
+    azimuth: float = 180.0,
+    lat: float = 51.05,
+    lon: float = 3.72,
 ) -> pd.Series:
-    day_of_year = timestamps.dayofyear.to_numpy()
-    hour = timestamps.hour.to_numpy() + timestamps.minute.to_numpy() / 60.0
+    """Calculates 15-minute synthetic PV generation calibrated to Flemish reference yields (~1,000 kWh/kWp/year)."""
+    # Dynamic Daylight Saving Time Offset for Belgium (CET = UTC+1, CEST = UTC+2)
+    is_dst = (timestamps >= pd.Timestamp("2026-03-29 03:00:00")) & (
+        timestamps < pd.Timestamp("2026-10-25 02:00:00")
+    )
+    dst_offset = np.where(is_dst, 2.0, 1.0)
+    local_hour = timestamps.hour.to_numpy() + timestamps.minute.to_numpy() / 60.0
+    utc_hour = local_hour - dst_offset
 
+    day_of_year = timestamps.dayofyear.to_numpy()
     declination = 23.45 * np.sin(np.radians(360 / 365 * (day_of_year - 81)))
     decl_rad = np.radians(declination)
-    lat_rad = np.radians(LATITUDE)
+    lat_rad = np.radians(lat)
 
     b = np.radians(360 / 365 * (day_of_year - 81))
     eot = 9.87 * np.sin(2 * b) - 7.53 * np.cos(b) - 1.5 * np.sin(b)
 
-    solar_time = hour + (4 * (LONGITUDE - 15 * 1) + eot) / 60.0
+    # True solar time from UTC
+    solar_time = utc_hour + (lon / 15.0) + (eot / 60.0)
     omega = np.radians(15.0 * (solar_time - 12.0))
 
     sin_elev = np.sin(lat_rad) * np.sin(decl_rad) + np.cos(lat_rad) * np.cos(
@@ -56,8 +68,8 @@ def calculate_pv_generation(
     elevation = np.arcsin(np.clip(sin_elev, -1.0, 1.0))
     zenith_rad = np.pi / 2 - elevation
 
-    tilt_rad = np.radians(PANEL_TILT)
-    surface_azimuth_rad = np.radians(PANEL_AZIMUTH - 180.0)
+    tilt_rad = np.radians(tilt)
+    surface_azimuth_rad = np.radians(azimuth - 180.0)
 
     cos_azimuth = np.clip(
         (
@@ -71,31 +83,44 @@ def calculate_pv_generation(
     solar_azimuth = np.where(
         omega > 0, np.pi - np.arccos(cos_azimuth), np.pi + np.arccos(cos_azimuth)
     )
-
     cos_theta = np.cos(zenith_rad) * np.cos(tilt_rad) + np.sin(
         zenith_rad
     ) * np.sin(tilt_rad) * np.cos(solar_azimuth - surface_azimuth_rad)
 
-    safe_sin_elev = np.maximum(0.0, sin_elev)
-    safe_cos_theta = np.maximum(0.0, cos_theta)
-    gti = np.where(
+    # PVGIS regional monthly insolation reference (kWh/kWp for South 35° in Flanders)
+    monthly_targets = {
+        1: 30.0,
+        2: 48.0,
+        3: 86.0,
+        4: 118.0,
+        5: 135.0,
+        6: 136.0,
+        7: 135.0,
+        8: 120.0,
+        9: 92.0,
+        10: 58.0,
+        11: 32.0,
+        12: 22.0,
+    }
+
+    geom_curve = np.where(
         (elevation > 0) & (cos_theta > 0),
-        1050 * (safe_sin_elev**1.1) * safe_cos_theta,
+        (np.maximum(0.0, sin_elev) ** 0.85) * np.maximum(0.0, cos_theta),
         0.0,
     )
 
-    pv_power_kw = (
-        peak_kwp
-        * (gti * CLIMATIC_YIELD_FACTOR / 1000.0)
-        * (1.0 - SYSTEM_LOSSES)
-    )
-    return pd.Series(
-        np.maximum(0.0, pv_power_kw * 0.25),
-        index=timestamps,
-        name="PV_Production_kWh",
-    )
+    df_temp = pd.DataFrame({"month": timestamps.month, "geom": geom_curve})
+    monthly_sums = df_temp.groupby("month")["geom"].transform("sum")
+    month_target_series = df_temp["month"].map(monthly_targets)
+
+    # Scale 15-minute generation so monthly totals match actual Flemish solar irradiance
+    pv_kwh_15m = (df_temp["geom"] / monthly_sums) * month_target_series * peak_kwp
+    return pd.Series(pv_kwh_15m.to_numpy(), index=timestamps, name="PV_Production_kWh")
 
 
+# ==========================================
+# 3. FULL YEAR RECONSTRUCTION
+# ==========================================
 def build_full_year_dataset(
     df_measured: pd.DataFrame, peak_kwp: float
 ) -> pd.DataFrame:
@@ -115,6 +140,15 @@ def build_full_year_dataset(
         common_idx, "Consumption_kWh"
     ]
 
+    # Handle spring DST jump: March 29 02:00-02:45 does not exist in local time
+    march_jump = [
+        ts
+        for ts in df_fy[df_fy["Consumption_kWh"].isna()].index
+        if ts.month == 3
+    ]
+    df_fy.loc[march_jump, "Consumption_kWh"] = 0.0
+
+    # Impute missing autumn months (Sep-Dec) by analogous seasonal profile
     month_map = {9: 5, 10: 4, 11: 2, 12: 1}
     missing_idx = df_fy[df_fy["Consumption_kWh"].isna()].index
 
@@ -144,7 +178,7 @@ def build_full_year_dataset(
 
 
 # ==========================================
-# 3. BATTERY DISPATCH (30 kWh / 10 kW)
+# 4. BATTERY DISPATCH SIMULATION
 # ==========================================
 def simulate_battery_storage(
     cons: np.ndarray,
@@ -158,45 +192,48 @@ def simulate_battery_storage(
 ) -> dict:
     charge_eff = np.sqrt(efficiency)
     discharge_eff = np.sqrt(efficiency)
-    max_step = max_power_kw * 0.25
+    max_step = max_power_kw * 0.25  # Rated AC energy per 15 min (2.5 kWh AC)
 
     u_min = capacity_kwh * min_soc
     u_max = capacity_kwh * max_soc
     stored = capacity_kwh * initial_soc
 
-    direct_solar = 0.0
-    bat_discharge = 0.0
-    grid_imp = 0.0
-    grid_exp = 0.0
+    n = len(cons)
+    direct_solar = np.zeros(n)
+    bat_discharge = np.zeros(n)
+    bat_charge = np.zeros(n)
+    grid_imp = np.zeros(n)
+    grid_exp = np.zeros(n)
+    soc_pct = np.zeros(n)
 
-    for i in range(len(cons)):
+    for i in range(n):
         c = cons[i]
         p = pv[i]
-        direct = c if c < p else p
-        direct_solar += direct
+        direct = min(c, p)
+        direct_solar[i] = direct
         surplus = p - direct
         deficit = c - direct
 
         if surplus > 0:
             space = (u_max - stored) / charge_eff
-            chg = surplus if surplus < max_step else max_step
-            if chg > space:
-                chg = space
+            chg = min(surplus, max_step, space)
+            bat_charge[i] = chg
             stored += chg * charge_eff
-            grid_exp += surplus - chg
+            grid_exp[i] = surplus - chg
         elif deficit > 0:
             avail = (stored - u_min) * discharge_eff
-            max_d = max_step * discharge_eff
-            dis = deficit if deficit < max_d else max_d
-            if dis > avail:
-                dis = avail
-            bat_discharge += dis
+            dis = min(deficit, max_step, avail)  # Capped by true AC inverter limit
+            bat_discharge[i] = dis
             stored -= dis / discharge_eff
-            grid_imp += deficit - dis
+            grid_imp[i] = deficit - dis
+
+        soc_pct[i] = (stored / capacity_kwh) * 100.0
 
     return {
         "Direct_PV_kWh": direct_solar,
+        "Battery_Charge_kWh": bat_charge,
         "Battery_Discharge_kWh": bat_discharge,
+        "Battery_SoC_pct": soc_pct,
         "Total_Self_Consumption_kWh": direct_solar + bat_discharge,
         "Grid_Import_kWh": grid_imp,
         "Grid_Export_kWh": grid_exp,
@@ -204,29 +241,31 @@ def simulate_battery_storage(
 
 
 # ==========================================
-# 4. TARIFF SENSITIVITY PLOTTER
+# 5. SPLIT SENSITIVITY & FINANCIAL PLOTTER
 # ==========================================
-def plot_tariff_sensitivity(
+def plot_split_tariff_sensitivity(
     self_cons_kwh: float,
     grid_exp_kwh: float,
+    cap_tariff_savings: float,
     capex: float = 30000.0,
     elec_range: np.ndarray = np.arange(0.18, 0.42, 0.02),
     inj_range: np.ndarray = np.arange(0.00, 0.16, 0.02),
 ):
-    payback_grid = np.zeros((len(elec_range), len(inj_range)))
-    savings_grid = np.zeros((len(elec_range), len(inj_range)))
+    payback_no_cap = np.zeros((len(elec_range), len(inj_range)))
+    payback_with_cap = np.zeros((len(elec_range), len(inj_range)))
 
     for i, ep in enumerate(elec_range):
         for j, ip in enumerate(inj_range):
-            annual_savings = self_cons_kwh * ep + grid_exp_kwh * ip
-            savings_grid[i, j] = annual_savings
-            payback_grid[i, j] = capex / annual_savings
+            s1 = self_cons_kwh * ep + grid_exp_kwh * ip
+            s2 = s1 + cap_tariff_savings
+            payback_no_cap[i, j] = capex / s1
+            payback_with_cap[i, j] = capex / s2
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
 
-    # Panel 1: Heatmap
-    im = axes[0].imshow(
-        payback_grid,
+    # Panel 1: Heatmap without Capacity Tariff
+    im1 = axes[0, 0].imshow(
+        payback_no_cap,
         cmap="RdYlGn_r",
         aspect="auto",
         origin="lower",
@@ -236,93 +275,156 @@ def plot_tariff_sensitivity(
             elec_range[0] - 0.01,
             elec_range[-1] + 0.01,
         ],
+        vmin=5.5,
+        vmax=13.5,
     )
-    axes[0].set_title(
-        f"1. Payback Period (Years) [Fixed 30 kWh / 10 kW, €{capex:,.0f} Capex]",
+    axes[0, 0].set_title(
+        "1. Payback (Years): EXCLUDING Capacity Tariff",
         fontsize=12,
         fontweight="bold",
     )
-    axes[0].set_xlabel("Injection Tariff (€/kWh)", fontsize=11)
-    axes[0].set_ylabel("Electricity Import Tariff (€/kWh)", fontsize=11)
-    axes[0].set_xticks(inj_range)
-    axes[0].set_yticks(elec_range)
-    axes[0].set_xticklabels([f"€{x:.2f}" for x in inj_range])
-    axes[0].set_yticklabels([f"€{x:.2f}" for x in elec_range])
-
+    axes[0, 0].set_xlabel("Injection Tariff (€/kWh)", fontsize=10)
+    axes[0, 0].set_ylabel("Electricity Import Tariff (€/kWh)", fontsize=10)
+    axes[0, 0].set_xticks(inj_range)
+    axes[0, 0].set_yticks(elec_range)
+    axes[0, 0].set_xticklabels([f"€{x:.2f}" for x in inj_range])
+    axes[0, 0].set_yticklabels([f"€{x:.2f}" for x in elec_range])
     for i, ep in enumerate(elec_range):
         for j, ip in enumerate(inj_range):
-            val = payback_grid[i, j]
-            axes[0].text(
+            val = payback_no_cap[i, j]
+            axes[0, 0].text(
                 ip,
                 ep,
                 f"{val:.1f}y",
                 ha="center",
                 va="center",
-                fontsize=8.5,
+                fontsize=8,
                 fontweight="bold",
-                color="white" if val < 8.5 or val > 12.5 else "black",
+                color="white" if val < 7.0 or val > 11.0 else "black",
             )
+    fig.colorbar(im1, ax=axes[0, 0], label="Years")
 
-    cbar = fig.colorbar(im, ax=axes[0])
-    cbar.set_label("Payback (Years)", fontsize=10)
-
-    # Panel 2: Curves vs Import Price
-    key_injections = [0.00, 0.04, 0.08, 0.12]
-    curve_colors = ["#264653", "#2a9d8f", "#e76f51", "#e63946"]
-    ep_continuous = np.linspace(0.18, 0.40, 60)
-
-    for ip, col in zip(key_injections, curve_colors):
-        sav = self_cons_kwh * ep_continuous + grid_exp_kwh * ip
-        axes[1].plot(
-            ep_continuous,
-            capex / sav,
-            lw=2.2,
-            color=col,
-            label=f"Injection: €{ip:.2f}/kWh",
-        )
-
-    axes[1].axvline(
-        BASE_ELEC_PRICE,
-        color="gray",
-        linestyle="--",
-        alpha=0.7,
-        label=f"Base Ref (€{BASE_ELEC_PRICE:.2f})",
+    # Panel 2: Heatmap with Capacity Tariff
+    im2 = axes[0, 1].imshow(
+        payback_with_cap,
+        cmap="RdYlGn_r",
+        aspect="auto",
+        origin="lower",
+        extent=[
+            inj_range[0] - 0.01,
+            inj_range[-1] + 0.01,
+            elec_range[0] - 0.01,
+            elec_range[-1] + 0.01,
+        ],
+        vmin=5.5,
+        vmax=13.5,
     )
-    axes[1].axhline(10.0, color="darkred", linestyle=":", alpha=0.6, label="10-Year Mark")
-
-    axes[1].set_title(
-        "2. Payback Period vs Electricity Price by Injection Tariff",
+    axes[0, 1].set_title(
+        "2. Payback (Years): INCLUDING Capacity Tariff",
         fontsize=12,
         fontweight="bold",
     )
-    axes[1].set_xlabel("Electricity Import Tariff (€/kWh)", fontsize=11)
-    axes[1].set_ylabel("Simple Payback Period (Years)", fontsize=11)
-    axes[1].set_xticks(np.arange(0.18, 0.42, 0.04))
-    axes[1].set_xticklabels([f"€{x:.2f}" for x in np.arange(0.18, 0.42, 0.04)])
-    axes[1].grid(True, linestyle="--", alpha=0.5)
-    axes[1].legend(loc="upper right", fontsize=9.5)
+    axes[0, 1].set_xlabel("Injection Tariff (€/kWh)", fontsize=10)
+    axes[0, 1].set_ylabel("Electricity Import Tariff (€/kWh)", fontsize=10)
+    axes[0, 1].set_xticks(inj_range)
+    axes[0, 1].set_yticks(elec_range)
+    axes[0, 1].set_xticklabels([f"€{x:.2f}" for x in inj_range])
+    axes[0, 1].set_yticklabels([f"€{x:.2f}" for x in elec_range])
+    for i, ep in enumerate(elec_range):
+        for j, ip in enumerate(inj_range):
+            val = payback_with_cap[i, j]
+            axes[0, 1].text(
+                ip,
+                ep,
+                f"{val:.1f}y",
+                ha="center",
+                va="center",
+                fontsize=8,
+                fontweight="bold",
+                color="white" if val < 7.0 or val > 11.0 else "black",
+            )
+    fig.colorbar(im2, ax=axes[0, 1], label="Years")
+
+    # Panel 3: Curve Comparison vs Import Price
+    ep_cont = np.linspace(0.18, 0.40, 60)
+    for ip, col in zip([0.00, 0.05, 0.10], ["#264653", "#2a9d8f", "#e76f51"]):
+        s1 = self_cons_kwh * ep_cont + grid_exp_kwh * ip
+        s2 = s1 + cap_tariff_savings
+        axes[1, 0].plot(
+            ep_cont,
+            capex / s1,
+            lw=2,
+            linestyle="--",
+            color=col,
+            label=f"Excl. Cap (Inj €{ip:.2f})",
+        )
+        axes[1, 0].plot(
+            ep_cont,
+            capex / s2,
+            lw=2.2,
+            linestyle="-",
+            color=col,
+            label=f"Incl. Cap (Inj €{ip:.2f})",
+        )
+
+    axes[1, 0].axvline(
+        BASE_ELEC_PRICE,
+        color="gray",
+        linestyle=":",
+        alpha=0.8,
+        label=f"Ref (€{BASE_ELEC_PRICE:.2f})",
+    )
+    axes[1, 0].set_title(
+        "3. Payback vs Import Price (Solid = Incl. Cap, Dashed = Excl.)",
+        fontsize=12,
+        fontweight="bold",
+    )
+    axes[1, 0].set_xlabel("Electricity Import Tariff (€/kWh)", fontsize=10)
+    axes[1, 0].set_ylabel("Simple Payback Period (Years)", fontsize=10)
+    axes[1, 0].grid(True, linestyle="--", alpha=0.5)
+    axes[1, 0].legend(fontsize=8, loc="upper right")
+
+    # Panel 4: 15-Year Cash Flow Projection
+    years = np.arange(0, 16)
+    base_s1 = self_cons_kwh * BASE_ELEC_PRICE + grid_exp_kwh * BASE_INJ_TARIFF
+    base_s2 = base_s1 + cap_tariff_savings
+    cf1 = -capex + base_s1 * years
+    cf2 = -capex + base_s2 * years
+
+    axes[1, 1].axhline(0, color="black", linestyle="-", lw=1, alpha=0.7)
+    axes[1, 1].plot(
+        years,
+        cf1,
+        marker="o",
+        color="#e76f51",
+        lw=2.2,
+        label=f"Excl. Cap (€{base_s1:,.0f}/yr, {capex/base_s1:.1f}y)",
+    )
+    axes[1, 1].plot(
+        years,
+        cf2,
+        marker="s",
+        color="#2a9d8f",
+        lw=2.2,
+        label=f"Incl. Cap (€{base_s2:,.0f}/yr, {capex/base_s2:.1f}y)",
+    )
+    axes[1, 1].set_title(
+        "4. Cumulative 15-Year Cash Flow (@ Base Reference Tariffs)",
+        fontsize=12,
+        fontweight="bold",
+    )
+    axes[1, 1].set_xlabel("Years in Operation", fontsize=10)
+    axes[1, 1].set_ylabel("Net Cumulative Cash Flow (€)", fontsize=10)
+    axes[1, 1].set_xticks(years)
+    axes[1, 1].grid(True, linestyle="--", alpha=0.5)
+    axes[1, 1].legend(fontsize=9, loc="lower right")
 
     plt.tight_layout()
     plt.show()
 
-    # Formatted terminal display
-    inspect_inj = [0.00, 0.03, 0.05, 0.08, 0.10]
-    inspect_elec = [0.20, 0.24, 0.28, 0.32, 0.36, 0.40]
-    df_table = pd.DataFrame(
-        index=[f"Import_€{ep:.2f}" for ep in inspect_elec],
-        columns=[f"Inj_€{ip:.2f}" for ip in inspect_inj],
-    )
-    for ep in inspect_elec:
-        for ip in inspect_inj:
-            sav = self_cons_kwh * ep + grid_exp_kwh * ip
-            df_table.loc[f"Import_€{ep:.2f}", f"Inj_€{ip:.2f}"] = (
-                f"{capex / sav:.1f} yrs (€{sav:,.0f}/yr)"
-            )
-    return df_table
-
 
 # ==========================================
-# 5. MAIN EXECUTION PIPELINE
+# 6. MAIN EXECUTION PIPELINE
 # ==========================================
 def run_padel_energy_model(filepath: Path):
     try:
@@ -334,6 +436,7 @@ def run_padel_energy_model(filepath: Path):
         return None
 
     timestamps = pd.to_datetime(raw_df.iloc[:, 1], errors="coerce")
+    # Read Column F directly as provided in the Excel file
     consumption = pd.to_numeric(raw_df.iloc[:, 5], errors="coerce").fillna(0.0)
 
     df_sample = (
@@ -362,43 +465,90 @@ def run_padel_energy_model(filepath: Path):
         initial_soc=INITIAL_SOC,
     )
 
+    for k, v in results.items():
+        df_fy[k] = v
+
     tot_cons = df_fy["Consumption_kWh"].sum()
     tot_pv = df_fy["PV_Production_kWh"].sum()
-    self_cons = results["Total_Self_Consumption_kWh"]
-    grid_imp = results["Grid_Import_kWh"]
-    grid_exp = results["Grid_Export_kWh"]
+    self_cons = results["Total_Self_Consumption_kWh"].sum()
+    grid_imp = results["Grid_Import_kWh"].sum()
+    grid_exp = results["Grid_Export_kWh"].sum()
+    direct_pv = results["Direct_PV_kWh"].sum()
+    bat_discharge = results["Battery_Discharge_kWh"].sum()
 
-    base_savings = self_cons * BASE_ELEC_PRICE + grid_exp * BASE_INJ_TARIFF
-    base_payback = INSTALLATION_COST / base_savings
+    # Calculate Flemish Capacity Tariff peak reductions
+    df_fy["Baseline_Power_kW"] = df_fy["Consumption_kWh"] * 4.0
+    df_fy["Grid_Import_Power_kW"] = df_fy["Grid_Import_kWh"] * 4.0
 
-    print("=" * 65)
-    print("PHYSICAL DISPATCH SUMMARY (30 kWh / 10 kW SYSTEM)")
-    print("=" * 65)
-    print(f"Annual Club Consumption:    {tot_cons:>10,.1f} kWh")
-    print(f"Annual Solar Generation:    {tot_pv:>10,.1f} kWh")
-    print(
-        f"Total Self-Consumption:     {self_cons:>10,.1f} kWh ({self_cons/tot_cons*100:.1f}% Autarky)"
+    # Monthly peaks with Flemish 2.5 kW floor
+    monthly_peak_baseline = np.maximum(
+        2.5, df_fy.groupby(df_fy.index.month)["Baseline_Power_kW"].max()
     )
-    print(f"Grid Import Required:       {grid_imp:>10,.1f} kWh")
-    print(f"Grid Feed-in Surplus:       {grid_exp:>10,.1f} kWh")
-    print("-" * 65)
-    print(
-        f"Reference Annual Savings:   €{base_savings:>10,.2f} / yr  (@ €{BASE_ELEC_PRICE:.2f} imp / €{BASE_INJ_TARIFF:.2f} inj)"
+    monthly_peak_system = np.maximum(
+        2.5, df_fy.groupby(df_fy.index.month)["Grid_Import_Power_kW"].max()
     )
-    print(
-        f"Reference Payback Period:    {base_payback:>10.1f} YEARS  (@ €{INSTALLATION_COST:,.0f} Capex)"
-    )
-    print("=" * 65)
 
-    # Launch price sensitivity
-    sensitivity_table = plot_tariff_sensitivity(
+    avg_peak_baseline = monthly_peak_baseline.mean()
+    avg_peak_system = monthly_peak_system.mean()
+
+    cap_cost_baseline = avg_peak_baseline * CAPACITY_TARIFF_EUR_PER_KW
+    cap_cost_system = avg_peak_system * CAPACITY_TARIFF_EUR_PER_KW
+    cap_tariff_savings = cap_cost_baseline - cap_cost_system
+
+    # Case 1: Excluding Capacity Tariff
+    savings_case1 = self_cons * BASE_ELEC_PRICE + grid_exp * BASE_INJ_TARIFF
+    payback_case1 = INSTALLATION_COST / savings_case1
+
+    # Case 2: Including Capacity Tariff
+    savings_case2 = savings_case1 + cap_tariff_savings
+    payback_case2 = INSTALLATION_COST / savings_case2
+
+    print("=" * 68)
+    print("PHYSICAL DISPATCH SUMMARY (42 PANELS / 30 kWh BATTERY)")
+    print("=" * 68)
+    print(f"Annual Club Consumption:      {tot_cons:>10,.1f} kWh")
+    print(
+        f"Annual Solar Generation:      {tot_pv:>10,.1f} kWh ({tot_pv/total_kwp:.1f} kWh/kWp)"
+    )
+    print(
+        f"Direct Solar Used On-Site:    {direct_pv:>10,.1f} kWh ({direct_pv/tot_cons*100:.1f}% of Demand)"
+    )
+    print(
+        f"Battery Energy Supplied:      {bat_discharge:>10,.1f} kWh ({bat_discharge/tot_cons*100:.1f}% of Demand)"
+    )
+    print(
+        f"Total On-Site Self-Consumption: {self_cons:>10,.1f} kWh ({self_cons/tot_cons*100:.1f}% Autarky)"
+    )
+    print(f"Grid Import Required:         {grid_imp:>10,.1f} kWh")
+    print(f"Grid Feed-in Surplus Sold:    {grid_exp:>10,.1f} kWh")
+    print("-" * 68)
+    print("FLEMISH CAPACITY TARIFF (CAPACITEITSTARIEF PEAK IMPACT)")
+    print(
+        f"Average Billed Peak Baseline: {avg_peak_baseline:>10.2f} kW  (Cost: €{cap_cost_baseline:,.2f}/yr)"
+    )
+    print(
+        f"Average Billed Peak With Bat: {avg_peak_system:>10.2f} kW  (Cost: €{cap_cost_system:,.2f}/yr)"
+    )
+    print(f"Peak Demand Savings:          €{cap_tariff_savings:>10.2f} / year")
+    print("=" * 68)
+    print("SPLIT BUSINESS CASE COMPARISON (€30,000 CAPEX)")
+    print("=" * 68)
+    print("CASE 1: EXCLUDING CAPACITY TARIFF (Energy Commodity Only)")
+    print(f"  * Annual Savings:           €{savings_case1:>10,.2f} / year")
+    print(f"  * Simple Payback Period:     {payback_case1:>10.2f} YEARS")
+    print("-" * 68)
+    print("CASE 2: INCLUDING CAPACITY TARIFF (Comprehensive Case)")
+    print(f"  * Annual Savings:           €{savings_case2:>10,.2f} / year")
+    print(f"  * Simple Payback Period:     {payback_case2:>10.2f} YEARS")
+    print("=" * 68)
+
+    plot_split_tariff_sensitivity(
         self_cons_kwh=self_cons,
         grid_exp_kwh=grid_exp,
+        cap_tariff_savings=cap_tariff_savings,
         capex=INSTALLATION_COST,
     )
 
-    print("\nSummary Tariff Matrix:\n")
-    print(sensitivity_table)
     return df_fy
 
 
